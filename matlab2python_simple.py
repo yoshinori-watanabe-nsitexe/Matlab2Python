@@ -5,6 +5,25 @@ import sys
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
+header="""
+# translated from MATLAB (heuristic)
+from __future__ import annotations
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import io
+from scipy.signal import find_peaks
+import glob
+import plot_validation_result_2 as p2
+from torch import Tensor,nn,optim,numel,randperm,manual_seed
+import pandas as pd
+import json
+from train_utils import create_TrainLoader,create_TestLoader,train_model,evaluate_model
+import datetime
+import time
+import os
+from utils import downsample,normalize,fullfile,height
+"""
+
 # --- Function mapping ----------------------------------------------------------
 
 FUNC_MAP_CALL_SIMPLE = {
@@ -39,7 +58,7 @@ FUNC_MAP_CALL_SIMPLE = {
     'cumsum': 'np.cumsum',
     'cumprod': 'np.cumprod',
     'diff': 'np.diff',
-
+    "sort":"sorted",
     # array creation
     'zeros': 'np.zeros',
     'ones': 'np.ones',
@@ -72,51 +91,38 @@ FUNC_MAP_CALL_SIMPLE = {
     'legend': 'plt.legend',
     'subplot': 'plt.subplot',
     'figure': 'plt.figure',
-    'hold': '',  # ignored
     'grid': 'plt.grid',
     'xlim': 'plt.xlim',
     'ylim': 'plt.ylim',
     'axis': 'plt.axis',
-    "hold on":"",
+    "xline":"plt.axhline",
+    "yline":"plt.axvline",
     #os
-    "mkdir":"os.makedirs",
-    #utils
+    "num2str":"str",
+    "strrep":"strrep",
+    "mkdir":"os.mkdir",
+    # ignored
     "hold on":"",
-    "hold on":"",
-    "hold on":"",
-    "hold on":"",
-
+    "hold off":"",
+    'hold': '',  
+    "clear;clc;close all":"",
+    
     #timer
     "tic":"tic=time.time()",
     "toc":"elapsedtime=time.time()-tic",
+    #table
+    "table()":"pd.DataFrame()",
+    "array2table":"pd.DataFrame",
+    "table2array":"np.array",
 }
 
 BLOCK_START = ("if", "for", "while", "switch", "try", "function")
 BLOCK_MID   = ("elseif", "else", "case", "otherwise", "catch")
-BLOCK_END   = ("end",)
-
-header=["""
-# translated from MATLAB (heuristic)
-from __future__ import annotations
-import numpy as np
-import matplotlib.pyplot as plt
-
-from scipy import io
-from scipy.signal import find_peaks
-import glob
-import plot_validation_result_2 as p2
-from torch import Tensor,nn,optim,numel,randperm,manual_seed
-import pandas as pd
-import json
-from train_utils import create_TrainLoader,create_TestLoader,train_model,evaluate_model
-import datetime
-import time
-import os
-import utils        
-"""]
+BLOCK_END   = ("end")
 
 
 def postprocess(s: str) -> str:
+   
     s=re.sub(r'^hold on', '', s)
     s=re.sub(r'^clc', '', s)
     s=re.sub(r'^close all', '', s)
@@ -124,21 +130,29 @@ def postprocess(s: str) -> str:
     s=re.sub(r'find_peaks\(([^() ]+)\)',r'find_peaks(\1,prominence=5)', s)
     s=s.replace("true","True")
     s=s.replace("false","False")
+    s=re.sub(r'unique\([^() ]+)\)', r'list(set(\1)', s)
 
     #配列のみ() to [] にしたい
     f=re.match(r'([^() ]+)\(',s)
-    #if(not f in FUNC_MAP_CALL_SIMPLE.keys() ): #pre
-    if(not f in list(FUNC_MAP_CALL_SIMPLE.values()) ): #post
+    if(not f in FUNC_MAP_CALL_SIMPLE.keys() ): #pre
         s=re.sub(r'([^() ]+)\((.+)\)', r'\1[\2]', s)
-
+    else:
+        s=re.sub(r'([^() ]+)\((.+)\)', r'\1(\2)', s)
+   
+    for c in FUNC_MAP_CALL_SIMPLE.keys():
+        s=s.replace(c,FUNC_MAP_CALL_SIMPLE[c])
     return s
 
 def strip_trailing_semicolon(s: str) -> str:
     # remove trailing semicolons (not in strings)
     # naive: drop ending ';' possibly with spaces
-    return re.sub(r';\s*$', '', s)
-
+    s= re.sub(r';\s*$', '', s)
+    s= re.sub(r';\s*#(.*)$', r'#\1', s)
+    s= re.sub(r';\s*%(.*)$', r'#\1', s)
+    return s
 #return re.sub(r'^%',"#",line)
+
+#if(not os.exists('Data_prepro_out_MEngine_ACO_10ms')):
 
 def replace_1line_comments(line: str) -> str:
     return re.sub(r'^%',"#",line)
@@ -193,6 +207,30 @@ def split_ellipsis(text: str) -> str:
         joined.append(buf)
     return "\n".join(joined)    
 
+def replace_olerators(py):
+    py = re.sub(r'\.\^', '**', py)
+    py = re.sub(r'\.\*', '*', py)
+    py = re.sub(r'\./', '/', py)
+    # power
+    py = re.sub(r'(?<!\.)\^', '**', py)
+    # logicals
+    py = re.sub(r'~=', '!=', py)
+    py = re.sub(r'&&', ' and ', py)
+    py = re.sub(r'\|\|', ' or ', py)
+    # unary not: ~A -> ~A in Python is bitwise not; better to map to not
+    py = re.sub(r'~(?=\w|\()', ' not ', py)
+    # pi
+    py = re.sub(r'\bpi\b', 'np.pi', py)
+    # transpose A' -> A.T (rough; skip if within quotes or followed by ')')
+    #py = re.sub(r"\b([A-Za-z_]\w*)\s*'", r"\1.T", py)
+    # size(A,1) → A.shape[0], size(A) → A.shape
+    py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*,\s*1\s*\)', r'\1.shape[0]', py)
+    py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*,\s*2\s*\)', r'\1.shape[1]', py)
+    py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*\)', r'\1.shape', py)
+    py = re.sub(r'\blength\(\s*([A-Za-z_]\w*)\s*\)', r'len(\1)', py)
+    py = re.sub(r'\bnumel\(\s*([A-Za-z_]\w*)\s*\)', r'\1.size', py)
+    py = re.sub(r'\bassignin\[s*\'([A-Za-z_]\'\w*),([A-Za-z_]\w*),([A-Za-z_]\w*)\s*\]', r'\1\[\2\]=\3', py)
+    return py
 # --- Converter core ------------------------------------------------------------
 @dataclass
 class Block:
@@ -237,7 +275,7 @@ class MatlabToPythonConverter:
                     body_lines.append(" " * (self.indent*4) + "return " + ", ".join(outs))
 
         # Prepend imports if used
-        return "".join(header + body_lines), warnings
+        return header +"".join(body_lines), warnings
 
     # --- line conversion ---
     def convert_line(self, line: str) -> Tuple[Optional[str|List[str]], List[str]]:
@@ -316,6 +354,7 @@ class MatlabToPythonConverter:
 
         if re.match(r'^\s*for\b', stripped):
             rhs = stripped[len('for'):].strip()
+            rhs = re.sub(r'1:length\(\s*([A-Za-z_]\w*)\s*\)', r'range(len(\1))', rhs)#convert range
             m = re.match(r'^([A-Za-z_]\w*)\s*=\s*(.+)$', rhs)
             if m:
                 var, rng = m.groups()
@@ -416,30 +455,7 @@ class MatlabToPythonConverter:
 
         # Operator replacements
         # element-wise first
-        py = re.sub(r'\.\^', '**', py)
-        py = re.sub(r'\.\*', '*', py)
-        py = re.sub(r'\./', '/', py)
-        # power
-        py = re.sub(r'(?<!\.)\^', '**', py)
-        # logicals
-        py = re.sub(r'~=', '!=', py)
-        py = re.sub(r'&&', ' and ', py)
-        py = re.sub(r'\|\|', ' or ', py)
-        # unary not: ~A -> ~A in Python is bitwise not; better to map to not
-        py = re.sub(r'~(?=\w|\()', ' not ', py)
-        # pi
-        py = re.sub(r'\bpi\b', 'np.pi', py)
-
-        # transpose A' -> A.T (rough; skip if within quotes or followed by ')')
-        #py = re.sub(r"\b([A-Za-z_]\w*)\s*'", r"\1.T", py)
-
-        # size(A,1) → A.shape[0], size(A) → A.shape
-        py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*,\s*1\s*\)', r'\1.shape[0]', py)
-        py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*,\s*2\s*\)', r'\1.shape[1]', py)
-        py = re.sub(r'\bsize\(\s*([A-Za-z_]\w*)\s*\)', r'\1.shape', py)
-        py = re.sub(r'\blength\(\s*([A-Za-z_]\w*)\s*\)', r'len(\1)', py)
-        py = re.sub(r'\bnumel\(\s*([A-Za-z_]\w*)\s*\)', r'\1.size', py)
-        py = re.sub(r'\bassignin\(s*([A-Za-z_]\w*),([A-Za-z_]\w*)r,([A-Za-z_]\w*)\s*\)', r'\1\[\2\]=\3', py)
+        py=replace_olerators(py)
         # replace function calls (simple map), track numpy/matplotlib usage
         def _replace_calls(m):
             name = m.group(1)
