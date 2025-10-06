@@ -20,4 +20,21 @@
 
 機能制限版  matlab2python_simple.py
 
-matlab関数のpython実装utils.py
+の利用を推奨します。
+
+matlabの多くの関数はnumpy,matplotlibに同名のものがありますが、ないものを実装したmatlab関数のpython実装　utils.py　もあります。
+
+## .matファイルのExcelへのexport,Pythonへのimport方法
+Excelにするのが最も簡単で確実だった。
+
+```matlab
+out=load("filename.mat") %load(filename)のみでいい
+Simulink.sdi.clear;
+runID = Simulink.sdi.createRun("run_from_simOut", "vars", out);
+Simulink.sdi.exportRun(runID, "to", "file", "file","FileName.xlsx");
+```
+
+```python
+import pandas as pd
+out=pd.read_excel("FileName.xlsx")
+```
